@@ -1,6 +1,7 @@
 """Public API objects exposed by the application package."""
 
 from .middleware import log_requests
+from .cache import MovieCache
 from .models import (
 	DatasetInfo,
 	HealthResponse,
@@ -19,6 +20,7 @@ from .utils import setup_logging
 
 __all__ = [
 	"DatasetInfo",
+		"MovieCache",
 	"MovieStorage",
 	"HealthResponse",
 	"MovieUploadInfo",

@@ -6,19 +6,20 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
-from src import MovieStorage
+from src import MovieCache, MovieStorage
 
 
 @pytest.fixture
-def movie_storage(tmp_path):
+def test_storage(tmp_path):
     """Return a fresh SQLite database in pytest's temporary directory."""
-    return MovieStorage(tmp_path / "movies.db")
+    return MovieStorage(tmp_path / "test_movies.db")
 
 
 @pytest.fixture
-def client(monkeypatch, movie_storage):
-    """Use a test database so tests never change the real movie collection."""
-    monkeypatch.setattr(main, "storage", movie_storage)
+def client(test_storage, monkeypatch):
+    """Use isolated storage and cache so tests cannot change real data."""
+    monkeypatch.setattr(main, "storage", test_storage)
+    monkeypatch.setattr(main, "cache", MovieCache())
     with TestClient(main.app) as test_client:
         yield test_client
 
@@ -35,3 +36,24 @@ def uploaded_movies(client, sample_csv_bytes):
     response = client.post("/upload", files={"file": ("sample_movies.csv", sample_csv_bytes, "text/csv")})
     assert response.status_code == 200
     return response.json()
+
+
+@pytest.fixture
+def processing_body():
+    """Configure required movie fields, duplicate cleanup, and rating outliers."""
+    return {
+        "validation": {
+            "required_columns": ["title", "release_year", "rating", "genre"],
+            "numeric_columns": ["release_year", "rating"],
+        },
+        "processing": {
+            "remove_duplicates": True,
+            "missing": {"enabled": True, "axis": "rows"},
+            "outliers": {
+                "enabled": True,
+                "columns": ["rating"],
+                "method": "iqr",
+                "threshold": 1.5,
+            },
+        },
+    }

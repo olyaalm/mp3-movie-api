@@ -1,9 +1,12 @@
 """Tests for the movie API, SQL queries, and SQLite persistence."""
 
 import sqlite3
+import string
+from pathlib import Path
 
 import pandas as pd
 import pytest
+import main
 
 from src import MovieStorage
 from src.storage import MOVIE_COLUMNS
@@ -94,6 +97,79 @@ def test_process_and_retrieve(client, uploaded_movies):
     assert client.get("/movies").json()["total_rows"] == 18
 
 
+def test_movies_persist(client, test_storage, uploaded_movies):
+    """Confirm SQLite persistence, source order, columns, and returned IDs."""
+    reopened_storage = MovieStorage(test_storage.db_path)
+    saved_movies = reopened_storage.get()
+    original_movies = pd.read_csv(Path(__file__).resolve().parent.parent / "fixtures" / "sample_movies.csv")
+
+    assert reopened_storage.count_movies() == 20
+    assert saved_movies.columns.tolist() == MOVIE_COLUMNS
+    assert saved_movies["title"].tolist() == original_movies["title"].tolist()
+
+    persisted_ids = [movie["id"] for movie in reopened_storage.select_columns(MOVIE_COLUMNS, limit=100)]
+    response = client.get("/movies", params={"limit": 100})
+    assert response.status_code == 200
+    response_ids = [movie["id"] for movie in response.json()["data"]]
+    assert persisted_ids == list(range(1, 21))
+    assert response_ids == persisted_ids
+
+
+def test_cache_and_processing(client, uploaded_movies, processing_body):
+    """Check limit-specific hits and invalidation after processing is saved."""
+    response_100 = client.get("/movies", params={"limit": 100})
+    response_1 = client.get("/movies", params={"limit": 1})
+    assert response_100.status_code == response_1.status_code == 200
+    assert main.cache.get(100) == response_100.json()
+    assert main.cache.get(1) == response_1.json()
+
+    repeated_100 = client.get("/movies", params={"limit": 100})
+    assert repeated_100.status_code == 200
+    assert repeated_100.json() == response_100.json()
+
+    processed = client.post("/movies/process", json=processing_body)
+    assert processed.status_code == 200
+    assert processed.json() == {
+        "validation_rows_removed": 0,
+        "cleaning_report": {
+            "rows_before": 20,
+            "rows_after": 16,
+            "rows_removed": 4,
+            "columns_before": 4,
+            "columns_after": 4,
+            "columns_removed": 0,
+        },
+    }
+    assert main.cache.get(100) is None
+    assert main.cache.get(1) is None
+
+    updated = client.get("/movies", params={"limit": 100})
+    assert updated.status_code == 200
+    updated_body = updated.json()
+    assert updated_body["total_rows"] == 16
+    assert [movie["title"] for movie in updated_body["data"]] == [
+        f"Movie {letter}" for letter in string.ascii_uppercase[:16]
+    ]
+    assert [movie["id"] for movie in updated_body["data"]] == list(range(1, 17))
+    assert main.cache.get(100) == updated_body
+
+
+def test_cache_hit_skips_database(client, uploaded_movies, monkeypatch):
+    """Verify a repeated movie retrieval returns without querying SQLite."""
+    first_response = client.get("/movies", params={"limit": 100})
+    assert first_response.status_code == 200
+
+    def fail_database_read(*args, **kwargs):
+        pytest.fail("A cache hit should not read from SQLite")
+
+    monkeypatch.setattr(main.storage, "select_columns", fail_database_read)
+    monkeypatch.setattr(main.storage, "count_movies", fail_database_read)
+
+    repeated_response = client.get("/movies", params={"limit": 100})
+    assert repeated_response.status_code == 200
+    assert repeated_response.json() == first_response.json()
+
+
 def test_failed_processing_preserves_collection(client, uploaded_movies):
     """Invalid processing settings do not replace the saved movie table."""
     before = client.get("/movies").json()
@@ -102,27 +178,27 @@ def test_failed_processing_preserves_collection(client, uploaded_movies):
     assert client.get("/movies").json() == before
 
 
-def test_storage_persists_and_handles_null(movie_storage):
+def test_storage_persists_and_handles_null(test_storage):
     """Reopening a database retains movies and preserves missing values as NULL."""
-    movie_storage.save(pd.DataFrame([["Example", None, None, "Drama"]], columns=MOVIE_COLUMNS))
-    reopened = MovieStorage(movie_storage.db_path)
+    test_storage.save(pd.DataFrame([["Example", None, None, "Drama"]], columns=MOVIE_COLUMNS))
+    reopened = MovieStorage(test_storage.db_path)
     assert reopened.count_movies() == 1
     assert reopened.select_columns(MOVIE_COLUMNS)[0] == {"id": 1, "title": "Example", "release_year": None, "rating": None, "genre": "Drama"}
 
 
-def test_storage_rolls_back_failed_insert(movie_storage):
+def test_storage_rolls_back_failed_insert(test_storage):
     """A failed insert rolls back the delete and keeps the previous collection."""
-    movie_storage.save(pd.DataFrame([["Original", 2020, 8.0, "Drama"]], columns=MOVIE_COLUMNS))
+    test_storage.save(pd.DataFrame([["Original", 2020, 8.0, "Drama"]], columns=MOVIE_COLUMNS))
     invalid = pd.DataFrame([[{"unsupported": "value"}, 2021, 9.0, "Comedy"]], columns=MOVIE_COLUMNS)
     with pytest.raises(sqlite3.Error):
-        movie_storage.save(invalid)
-    assert movie_storage.select_columns(["title"]) == [{"id": 1, "title": "Original"}]
+        test_storage.save(invalid)
+    assert test_storage.select_columns(["title"]) == [{"id": 1, "title": "Original"}]
 
 
-def test_storage_rejects_empty_or_invalid_columns(movie_storage):
+def test_storage_rejects_empty_or_invalid_columns(test_storage):
     """Only known column names can be included in generated SQL."""
     for columns in ([], ["unknown"]):
         with pytest.raises(ValueError):
-            movie_storage.select_columns(columns)
+            test_storage.select_columns(columns)
         with pytest.raises(ValueError):
-            movie_storage.query_movies(columns, 0, 5)
+            test_storage.query_movies(columns, 0, 5)

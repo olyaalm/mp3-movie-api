@@ -10,6 +10,7 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from data_pipeline import create_cleaning_report, process_data, validate_dataframe
 from src import (
     HealthResponse,
+        MovieCache,
     MovieDataResponse,
     MovieProcessingReport,
     MovieStorage,
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Movie API", version="1.0.0")
 app.middleware("http")(log_requests)
 storage = MovieStorage()
+cache = MovieCache()
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -67,6 +69,7 @@ async def upload_movies(file: UploadFile = File(...)):
     # Keep the database unchanged until the input passes both checks.
     df = df[MOVIE_COLUMNS]
     storage.save(df)
+    cache.invalidate()
     logger.info("Uploaded movies: filename=%s, rows=%s", filename, len(df))
     return {
         "filename": filename,
@@ -86,9 +89,16 @@ def get_movies(limit: int = Query(default=100, ge=1)):
     Returns:
         dict: Movie records and the total number stored.
     """
+    cached_response = cache.get(limit)
+    if cached_response is not None:
+        logger.info("Returned cached movies: limit=%s", limit)
+        return cached_response
+
     rows = storage.select_columns(MOVIE_COLUMNS, limit)
     logger.info("Retrieved movies: returned_rows=%s", len(rows))
-    return {"data": rows, "total_rows": storage.count_movies()}
+    response = {"data": rows, "total_rows": storage.count_movies()}
+    cache.set(limit, response)
+    return response
 
 
 @app.get("/movies/search", response_model=list[dict])
@@ -148,6 +158,7 @@ def process_movies(config: ProcessConfig):
         processed = process_data(validated, settings)
         report = create_cleaning_report(before_processing, processed)
         storage.save(processed)
+        cache.invalidate()
     except ValueError as error:
         logger.warning("Movie processing rejected: %s", error)
         raise HTTPException(status_code=400, detail=str(error)) from error
